@@ -10,12 +10,19 @@ from collections import Counter
 # Your birthday as YYYY-MM-DD, read from the BIRTHDAY environment variable so it isn't committed to a public repo
 BIRTHDAY = os.environ.get('BIRTHDAY')
 
+# ---------- settings you may want to change ----------
+LOC_DAYS = 365               # the "Lines" stat only counts commits made in the last this-many days
+MAX_LINES_PER_COMMIT = 5000  # ...and ignores any single commit bigger than this (vendored code, lock files, generated files). None = no limit
+LINE_WIDTH = 58              # every line of the info column is padded to exactly this many characters. 58 characters end about 38px inside the 985px wide image
+SEP_COL = 34                 # column of the "|" on the Repos and Commits lines, so the two lines line up
+
 # Fine-grained personal access token with All Repositories access:
 # Account permissions: read:Followers, read:Starring, read:Watching
 # Repository permissions: read:Commit statuses, read:Contents, read:Issues, read:Metadata, read:Pull Requests
 # Issues and pull requests permissions not needed at the moment, but may be used in the future
 HEADERS = {'authorization': 'token '+ os.environ['ACCESS_TOKEN']}
 USER_NAME = os.environ['USER_NAME'] # your own GitHub username
+REPO_EDGES = [] # the repositories found by loc_query(), kept for recent_loc()
 WARNINGS = [] # short notes printed at the end of the run (never repository names, so public logs stay private)
 QUERY_COUNT = {'verify_token_owner': 0, 'user_getter': 0, 'follower_getter': 0, 'graph_repos_stars': 0, 'recursive_loc': 0, 'graph_commits': 0, 'loc_query': 0}
 
@@ -134,18 +141,18 @@ def graph_repos_stars(count_type, owner_affiliation, cursor=None, add_loc=0, del
             return stars_counter(request.json()['data']['user']['repositories']['edges'])
 
 
-def recursive_loc(owner, repo_name, data, cache_comment, addition_total=0, deletion_total=0, my_commits=0, cursor=None, page_size=100):
+def recursive_loc(owner, repo_name, data, cache_comment, addition_total=0, deletion_total=0, my_commits=0, cursor=None, page_size=100, since=None):
     """
     Uses GitHub's GraphQL v4 API and cursor pagination to fetch 100 commits from a repository at a time
     """
     query_count('recursive_loc')
     query = '''
-    query ($repo_name: String!, $owner: String!, $cursor: String, $page_size: Int!, $author_id: ID!) {
+    query ($repo_name: String!, $owner: String!, $cursor: String, $page_size: Int!, $author_id: ID!SINCE_DECLARATION) {
         repository(name: $repo_name, owner: $owner) {
             defaultBranchRef {
                 target {
                     ... on Commit {
-                        history(first: $page_size, after: $cursor, author: {id: $author_id}) {
+                        history(first: $page_size, after: $cursor, author: {id: $author_id}SINCE_ARGUMENT) {
                             totalCount
                             edges {
                                 node {
@@ -171,18 +178,20 @@ def recursive_loc(owner, repo_name, data, cache_comment, addition_total=0, delet
             }
         }
     }'''
+    query = query.replace('SINCE_DECLARATION', ', $since: GitTimestamp!' if since else '').replace('SINCE_ARGUMENT', ', since: $since' if since else '')
     variables = {'repo_name': repo_name, 'owner': owner, 'cursor': cursor, 'page_size': page_size, 'author_id': OWNER_ID['id']}
+    if since: variables['since'] = since
     request = post_with_retry(query, variables, tries=2, delay=3) # I cannot use simple_request(), because I want to save the file before raising Exception
     if request.status_code in (502, 503, 504):
         # GitHub times out when asked to total up too many (or too large) commits at once.
         # Ask again for fewer commits from the same spot; if even 1 commit times out, skip this repository for now.
         if page_size > 1:
-            return recursive_loc(owner, repo_name, data, cache_comment, addition_total, deletion_total, my_commits, cursor, max(1, page_size // 4))
+            return recursive_loc(owner, repo_name, data, cache_comment, addition_total, deletion_total, my_commits, cursor, max(1, page_size // 4), since)
         WARNINGS.append('a repository was skipped because GitHub kept timing out on it; it will be retried on the next run')
         return 0 # cache_builder records this as "0 0 0 0", which makes the next run try this repository again
     if request.status_code == 200:
         if request.json()['data']['repository']['defaultBranchRef'] != None: # Only count commits if repo isn't empty
-            return loc_counter_one_repo(owner, repo_name, data, cache_comment, request.json()['data']['repository']['defaultBranchRef']['target']['history'], addition_total, deletion_total, my_commits, page_size)
+            return loc_counter_one_repo(owner, repo_name, data, cache_comment, request.json()['data']['repository']['defaultBranchRef']['target']['history'], addition_total, deletion_total, my_commits, page_size, since)
         else: return 0
     force_close_file(data, cache_comment) # saves what is currently in the file before this program crashes
     if request.status_code == 403:
@@ -190,20 +199,22 @@ def recursive_loc(owner, repo_name, data, cache_comment, addition_total=0, delet
     raise Exception('recursive_loc() has failed with a', request.status_code, request.text, QUERY_COUNT)
 
 
-def loc_counter_one_repo(owner, repo_name, data, cache_comment, history, addition_total, deletion_total, my_commits, page_size=100):
+def loc_counter_one_repo(owner, repo_name, data, cache_comment, history, addition_total, deletion_total, my_commits, page_size=100, since=None):
     """
     Recursively call recursive_loc (since GraphQL can only search 100 commits at a time) 
     only adds the LOC value of commits authored by me
     """
     for node in history['edges']:
         if node['node']['author']['user'] == OWNER_ID:
+            if since and MAX_LINES_PER_COMMIT and node['node']['additions'] + node['node']['deletions'] > MAX_LINES_PER_COMMIT:
+                continue # recent lines only: ignore huge commits (vendored code, lock files, generated files)
             my_commits += 1
             addition_total += node['node']['additions']
             deletion_total += node['node']['deletions']
 
     if history['edges'] == [] or not history['pageInfo']['hasNextPage']:
         return addition_total, deletion_total, my_commits
-    else: return recursive_loc(owner, repo_name, data, cache_comment, addition_total, deletion_total, my_commits, history['pageInfo']['endCursor'], min(100, page_size * 2))
+    else: return recursive_loc(owner, repo_name, data, cache_comment, addition_total, deletion_total, my_commits, history['pageInfo']['endCursor'], min(100, page_size * 2), since)
 
 
 def loc_query(owner_affiliation, comment_size=0, force_cache=False, cursor=None, edges=[]):
@@ -247,7 +258,8 @@ def loc_query(owner_affiliation, comment_size=0, force_cache=False, cursor=None,
         edges += request.json()['data']['user']['repositories']['edges']            # Add on to the LoC count
         return loc_query(owner_affiliation, comment_size, force_cache, request.json()['data']['user']['repositories']['pageInfo']['endCursor'], edges)
     else:
-        return cache_builder([edge for edge in edges + request.json()['data']['user']['repositories']['edges'] if edge and edge['node']], comment_size, force_cache)
+        REPO_EDGES[:] = [edge for edge in edges + request.json()['data']['user']['repositories']['edges'] if edge and edge['node']]
+        return cache_builder(REPO_EDGES, comment_size, force_cache)
 
 
 def cache_builder(edges, comment_size, force_cache, loc_add=0, loc_del=0):
@@ -305,6 +317,30 @@ def cache_builder(edges, comment_size, force_cache, loc_add=0, loc_del=0):
     return [loc_add, loc_del, loc_add - loc_del, cached]
 
 
+def recent_loc(comment_size):
+    """
+    Lines added and deleted in the commits I made during the last LOC_DAYS days (huge commits ignored, see MAX_LINES_PER_COMMIT).
+    Uses the repository list from loc_query() and its cache, which says which repositories I have commits in.
+    This is one quick request per such repository (only my recent commits are fetched), so it is not cached.
+    """
+    since = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=LOC_DAYS)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    filename = 'cache/'+hashlib.sha256(USER_NAME.encode('utf-8')).hexdigest()+'.txt'
+    with open(filename, 'r') as f:
+        lines = f.readlines()
+    cache_comment, data = lines[:comment_size], lines[comment_size:]
+    my_commits = {line.split()[0]: int(line.split()[2]) for line in data}
+    added = deleted = 0
+    for edge in REPO_EDGES:
+        if my_commits.get(hashlib.sha256(edge['node']['nameWithOwner'].encode('utf-8')).hexdigest(), 0) == 0:
+            continue # I have no commits in this repository
+        owner, repo_name = edge['node']['nameWithOwner'].split('/')
+        result = recursive_loc(owner, repo_name, data, cache_comment, since=since)
+        if result: # 0 means the repository is empty or was skipped
+            added += result[0]
+            deleted += result[1]
+    return [added, deleted, added - deleted]
+
+
 def flush_cache(edges, filename, comment_size):
     """
     Wipes the cache file
@@ -342,39 +378,103 @@ def stars_counter(data):
     return total_stars
 
 
+SVG_NS = '{http://www.w3.org/2000/svg}'
+MIN_LEADER = 3 # shortest dot leader that still looks like one: " . "
+
+
 def svg_overwrite(filename, age_data, commit_data, star_data, repo_data, contrib_data, follower_data, loc_data):
     """
-    Parse SVG files and update elements with my age, commits, stars, repositories, and lines written
+    Parse SVG files and update elements with my age, commits, stars, repositories, and lines written.
+    Every line of the info column ends up exactly LINE_WIDTH characters wide, so nothing can run past the right-hand padding.
     """
     tree = etree.parse(filename)
     root = tree.getroot()
-    justify_format(root, 'age_data', age_data, 49)
-    justify_format(root, 'commit_data', commit_data, 23)  # 23 because the label is spelled 'Commits' now
-    justify_format(root, 'star_data', star_data, 14)
-    justify_format(root, 'repo_data', repo_data, 6)
-    justify_format(root, 'contrib_data', contrib_data)
-    justify_format(root, 'follower_data', follower_data, 10)
-    justify_format(root, 'loc_data', loc_data[2], 9)
-    justify_format(root, 'loc_add', loc_data[0])
-    justify_format(root, 'loc_del', loc_data[1], 7)
+    numbers = {'commit_data': commit_data, 'star_data': star_data, 'repo_data': repo_data, 'contrib_data': contrib_data,
+               'follower_data': follower_data, 'loc_data': loc_data[2], 'loc_add': loc_data[0], 'loc_del': loc_data[1]}
+    find_and_replace(root, 'age_data', age_data)
+    for shorten in (format_number, abbreviate): # full numbers first; abbreviated ones (1.2M) only if the full ones do not fit
+        for element_id, value in numbers.items():
+            find_and_replace(root, element_id, shorten(value))
+        too_long = fit_info_lines(root)
+        if not too_long: break
+    if too_long:
+        raise Exception(filename + ' has lines wider than ' + str(LINE_WIDTH) + ' characters even with abbreviated numbers (y=' + ', y='.join(too_long) + '). Shorten that text in the SVG.')
     tree.write(filename, encoding='utf-8', xml_declaration=True)
 
 
-def justify_format(root, element_id, new_text, length=0):
+def format_number(value):
+    """1234567 -> '1,234,567'"""
+    return '{:,}'.format(value) if isinstance(value, int) else str(value)
+
+
+def abbreviate(value):
+    """Short form, used only when the full numbers do not fit on a line: 1234567 -> '1.2M'"""
+    if abs(value) < 1000: return str(value)
+    for size, suffix in ((1000, 'k'), (1000000, 'M'), (1000000000, 'B')):
+        if abs(value) / size < 999.95 or suffix == 'B': # 999,999 becomes 1M, not 1000k
+            return ('{:.1f}'.format(value / size)).rstrip('0').rstrip('.') + suffix
+
+
+def char_width(char):
+    """Emoji, like the birthday cake, are drawn two characters wide"""
+    return 2 if ord(char) >= 0x1F300 else 1
+
+
+def info_lines(root):
     """
-    Updates and formats the text of the element, and modifes the amount of dots in the previous element to justify the new text on the svg
+    Splits the info column (the <text> that starts at x=390) into lines.
+    A line starts at an element with a y attribute and includes every element after it, up to the next line.
     """
-    if isinstance(new_text, int):
-        new_text = f"{'{:,}'.format(new_text)}"
-    new_text = str(new_text)
-    find_and_replace(root, element_id, new_text)
-    just_len = max(0, length - len(new_text))
-    if just_len <= 2:
-        dot_map = {0: '', 1: ' ', 2: '. '}
-        dot_string = dot_map[just_len]
-    else:
-        dot_string = ' ' + ('.' * just_len) + ' '
-    find_and_replace(root, f"{element_id}_dots", dot_string)
+    column = [text for text in root.iter(SVG_NS + 'text') if text.get('x') == '390'][0]
+    lines = []
+    for node in column:
+        if node.get('y') is not None: lines.append([])
+        lines[-1].append(node)
+    return lines
+
+
+def line_text(line):
+    return ''.join(''.join(node.itertext()) + (node.tail or '') for node in line).rstrip('\n')
+
+
+def line_length(line):
+    return sum(char_width(char) for char in line_text(line))
+
+
+def leaders(length):
+    """A dot leader that is exactly `length` characters long"""
+    if length <= 0: return ''
+    if length == 1: return ' '
+    if length == 2: return '. '
+    return ' ' + '.' * (length - 2) + ' '
+
+
+def fit_info_lines(root):
+    """
+    Pads every line to exactly LINE_WIDTH characters by stretching its dot leaders (the elements whose id ends in _dots).
+    Returns the y of every line that is still too wide. Lines with statistics can be fixed by abbreviating their numbers;
+    any other line has to be shortened in the SVG itself.
+    """
+    too_long = []
+    for line in info_lines(root):
+        stretch = [node for node in line if (node.get('id') or '').endswith('_dots') and node.get('id') != 'loc_del_dots']
+        for node in line:
+            if node.get('id') == 'loc_del_dots': node.text = ''
+        for node in stretch: node.text = ''
+        room = LINE_WIDTH - line_length(line) # characters left over for the dot leaders
+        if room < 0:
+            too_long.append(line[0].get('y'))
+            continue
+        if not stretch: continue
+        if len(stretch) == 1:
+            sizes = [room]
+        else: # Repos and Commits lines: two leaders, with the "|" kept in column SEP_COL
+            bar = line_text(line).find('|')
+            first = room // 2 if bar < 0 else SEP_COL - bar
+            first = max(MIN_LEADER, min(first, room - MIN_LEADER)) if room >= 2 * MIN_LEADER else room // 2
+            sizes = [first, room - first]
+        for node, size in zip(stretch, sizes): node.text = leaders(size)
+    return too_long
 
 
 def find_and_replace(root, element_id, new_text):
@@ -479,7 +579,7 @@ def formatter(query_type, difference, funct_return=False, whitespace=0):
 
 if __name__ == '__main__':
     """
-    Rudra Chavda (rudrachavda), 2022-2025
+    Andrew Grant (Andrew6rant), 2022-2025
     """
     if not BIRTHDAY:
         raise SystemExit('Set the BIRTHDAY environment variable (YYYY-MM-DD) first.')
@@ -496,21 +596,18 @@ if __name__ == '__main__':
     formatter('age calculation', age_time)
     total_loc, loc_time = perf_counter(loc_query, ['OWNER', 'COLLABORATOR', 'ORGANIZATION_MEMBER'], 7)
     formatter('LOC (cached)', loc_time) if total_loc[-1] else formatter('LOC (no cache)', loc_time)
+    recent_data, recent_time = perf_counter(recent_loc, 7)
+    formatter('LOC (last ' + str(LOC_DAYS) + ' days)', recent_time)
     commit_data, commit_time = perf_counter(commit_counter, 7)
     star_data, star_time = perf_counter(graph_repos_stars, 'stars', ['OWNER'])
     repo_data, repo_time = perf_counter(graph_repos_stars, 'repos', ['OWNER'])
     contrib_data, contrib_time = perf_counter(graph_repos_stars, 'repos', ['OWNER', 'COLLABORATOR', 'ORGANIZATION_MEMBER'])
     follower_data, follower_time = perf_counter(follower_getter, USER_NAME)
 
-    for index in range(len(total_loc)-1): total_loc[index] = '{:,}'.format(total_loc[index]) # format added, deleted, and total LOC
+    svg_overwrite('dark_mode.svg', age_data, commit_data, star_data, repo_data, contrib_data, follower_data, recent_data)
+    svg_overwrite('light_mode.svg', age_data, commit_data, star_data, repo_data, contrib_data, follower_data, recent_data)
 
-    svg_overwrite('dark_mode.svg', age_data, commit_data, star_data, repo_data, contrib_data, follower_data, total_loc[:-1])
-    svg_overwrite('light_mode.svg', age_data, commit_data, star_data, repo_data, contrib_data, follower_data, total_loc[:-1])
-
-    # move cursor to override 'Calculation times:' with 'Total function time:' and the total function time, then move cursor back
-    print('\033[F\033[F\033[F\033[F\033[F\033[F\033[F\033[F',
-        '{:<21}'.format('Total function time:'), '{:>11}'.format('%.4f' % (user_time + age_time + loc_time + commit_time + star_time + repo_time + contrib_time)),
-        ' s \033[E\033[E\033[E\033[E\033[E\033[E\033[E\033[E', sep='')
+    print('{:<23}'.format('   Total function time:'), '{:>12}'.format('%.4f' % (user_time + age_time + loc_time + recent_time + commit_time + star_time + repo_time + contrib_time) + ' s '), sep='')
 
     print('Total GitHub GraphQL API calls:', '{:>3}'.format(sum(QUERY_COUNT.values())))
     for funct_name, count in QUERY_COUNT.items(): print('{:<28}'.format('   ' + funct_name + ':'), '{:>6}'.format(count))
